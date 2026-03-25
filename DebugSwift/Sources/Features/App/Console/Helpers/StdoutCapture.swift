@@ -8,140 +8,13 @@
 import Foundation
 import UIKit
 
-// MARK: - Global C-Compatible Function and State
+// MARK: - StdoutCapture
 
-/// Global state for C function pointer compatibility
-nonisolated(unsafe) private var originalStdoutWriter: (@convention(c) (UnsafeMutableRawPointer?, UnsafePointer<Int8>?, Int32) -> Int32)?
-nonisolated(unsafe) private var stdoutBuffer = ""
-nonisolated(unsafe) private var _isCapturing = false
-
-/// Thread-safe locks for global state
-private let bufferLock = NSLock()
-private let stateLock = NSLock()
-private let processingQueue = DispatchQueue(
-    label: "com.debugswift.stdout.processing",
-    qos: .utility,
-    attributes: .concurrent
-)
-
-/// Thread-safe accessors for global state
-private var isStdoutCapturing: Bool {
-    get {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return _isCapturing
-    }
-    set {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        _isCapturing = newValue
-    }
-}
-
-/// Global thread-safe buffered logging
-private func logStdoutMessageGlobal(_ string: String) {
-    guard isStdoutCapturing else { return }
-
-    bufferLock.lock()
-    defer { bufferLock.unlock() }
-
-    stdoutBuffer += string
-
-    // Process complete lines for better log organization
-    let newlineSet = CharacterSet.newlines
-    if let lastScalar = stdoutBuffer.unicodeScalars.last,
-       newlineSet.contains(lastScalar) {
-
-        let trimmed = stdoutBuffer.trimmingCharacters(in: newlineSet)
-        if !trimmed.isEmpty {
-            // Async file writing and console processing
-            processingQueue.async {
-                processCompleteLogLineGlobal(trimmed)
-            }
-        }
-        stdoutBuffer = ""
-    }
-}
-
-/// Global processing for complete log lines
-private func processCompleteLogLineGlobal(_ line: String) {
-    // File logging
-    if let logUrl = StdoutCapture.shared.logUrl {
-        do {
-            try line.appendLineToURL(logUrl)
-        } catch {
-            // Silent failure for file writing
-        }
-    }
-
-    // Console output processing
-    appendConsoleOutputSafelyGlobal(line)
-}
-
-/// Global thread-safe console output with filtering
-private func appendConsoleOutputSafelyGlobal(_ output: String) {
-    guard !shouldIgnoreLogGlobal(output), shouldIncludeLogGlobal(output) else { return }
-
-    // Direct append without additional async to prevent delays
-    ConsoleOutput.shared.addPrintAndNSLogOutput(output)
-}
-
-private func shouldIgnoreLogGlobal(_ log: String) -> Bool {
-    DebugSwift.Console.shared.ignoredLogs.contains { log.contains($0) }
-}
-
-private func shouldIncludeLogGlobal(_ log: String) -> Bool {
-    if DebugSwift.Console.shared.onlyLogs.isEmpty {
-        return true
-    }
-    return DebugSwift.Console.shared.onlyLogs.contains { log.contains($0) }
-}
-
-// MARK: - C-Convention Handlers
-
-/// Replacement for stdout _write function
-@_cdecl("capturedStdoutWriter")
-private func capturedStdoutWriter(
-    fd: UnsafeMutableRawPointer?,
-    buffer: UnsafePointer<Int8>?,
-    size: Int32
-) -> Int32 {
-    // Call the original writer first
-    let result = originalStdoutWriter?(fd, buffer, size) ?? size
-
-    // Only capture if enabled and buffer valid
-    guard isStdoutCapturing, let buf = buffer, size > 0 else {
-        return result
-    }
-
-    // Safe string creation with size limit
-    let safeSize = min(Int(size), 8192)
-    let raw = UnsafeRawBufferPointer(start: buf, count: safeSize)
-    guard let string = String(bytes: raw, encoding: .utf8), !string.isEmpty else {
-        return result
-    }
-
-    // Async processing
-    processingQueue.async {
-        logStdoutMessageGlobal(string)
-    }
-
-    return result
-}
-
-/// Restorer function to reinstate the original writer
-@_cdecl("standardStdoutWriter")
-private func standardStdoutWriter(
-    fd: UnsafeMutableRawPointer?,
-    buffer: UnsafePointer<Int8>?,
-    size: Int32
-) -> Int32 {
-    return originalStdoutWriter?(fd, buffer, size) ?? size
-}
-
-// MARK: - StdoutCapture Class
-
-class StdoutCapture: @unchecked Sendable {
+/// Captures stdout at the file-descriptor level (`dup2` + pipe) so `print` and C writes to fd 1
+/// are mirrored into the DebugSwift console even when the Xcode debugger is not attached.
+/// Replacing only `stdout.pointee._write` is unreliable off-debugger because libc/Swift may write
+/// via `write(1, …)` or a `FILE` that does not go through the hooked `_write`.
+final class StdoutCapture: @unchecked Sendable {
     static let shared = StdoutCapture()
 
     let logUrl: URL? = {
@@ -156,20 +29,52 @@ class StdoutCapture: @unchecked Sendable {
         return nil
     }()
 
+    private let captureQueue = DispatchQueue(
+        label: "com.debugswift.stdout.capture",
+        qos: .utility
+    )
+
+    private let processingQueue = DispatchQueue(
+        label: "com.debugswift.stdout.processing",
+        qos: .utility,
+        attributes: .concurrent
+    )
+
+    private let stateLock = NSLock()
+    private var _isCapturing = false
+
+    private var isCapturing: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _isCapturing
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            _isCapturing = newValue
+        }
+    }
+
+    private var inputPipe: Pipe?
+    /// Duplicate of the original stdout sink (created before `dup2` redirects fd 1).
+    private var savedStdoutFd: Int32 = -1
+
+    private let lineBufferLock = NSLock()
+    private var lineBuffer = Data()
+
     private init() {}
 
     // MARK: - Public API
 
     func startCapturing() {
-        guard !isStdoutCapturing else { return }
-        isStdoutCapturing = true
-
-        Task {
-            if let logUrl = logUrl {
+        let instance = Self.shared
+        Task { @MainActor in
+            if let logUrl = instance.logUrl {
                 do {
                     let header = """
                     Start logger
-                    DeviceID: \(await UIDevice.current.identifierForVendor?.uuidString ?? "none")
+                    DeviceID: \(UIDevice.current.identifierForVendor?.uuidString ?? "none")
                     """
                     try header.write(to: logUrl, atomically: true, encoding: .utf8)
                 } catch {
@@ -177,41 +82,139 @@ class StdoutCapture: @unchecked Sendable {
                 }
             }
 
-            await MainActor.run {
-                self.interceptStdoutWriter()
+            instance.captureQueue.async {
+                instance.startCapturingInternal()
             }
         }
     }
 
     func stopCapturing() {
-        guard isStdoutCapturing else { return }
-        isStdoutCapturing = false
-
-        // Restore original writer
-        restoreOriginalStdoutWriter()
-
-        // Clear buffer
-        bufferLock.lock()
-        stdoutBuffer = ""
-        bufferLock.unlock()
-    }
-
-    // MARK: - Private Methods
-
-    @MainActor
-    private func interceptStdoutWriter() {
-        // Store original writer only once
-        if originalStdoutWriter == nil {
-            originalStdoutWriter = stdout.pointee._write
+        captureQueue.async { [weak self] in
+            self?.stopCapturingInternal()
         }
-        // Redirect to our C-compatible handler
-        stdout.pointee._write = capturedStdoutWriter
     }
 
-    private func restoreOriginalStdoutWriter() {
-        guard let original = originalStdoutWriter else { return }
-        stdout.pointee._write = original
-        originalStdoutWriter = nil
+    // MARK: - Private
+
+    private func startCapturingInternal() {
+        guard !isCapturing else { return }
+
+        fflush(stdout)
+
+        let saved = dup(FileHandle.standardOutput.fileDescriptor)
+        guard saved >= 0 else {
+            return
+        }
+
+        let pipe = Pipe()
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard let self else {
+                handle.readabilityHandler = nil
+                return
+            }
+            self.captureQueue.async { [weak self] in
+                guard let self else { return }
+                guard self.isCapturing, self.savedStdoutFd >= 0 else { return }
+
+                let data = handle.availableData
+                if data.isEmpty {
+                    return
+                }
+
+                let forwardFd = self.savedStdoutFd
+                data.withUnsafeBytes { raw in
+                    guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    _ = write(forwardFd, base, data.count)
+                }
+
+                self.appendAndProcessLines(data)
+            }
+        }
+
+        // Ready before redirect so the first bytes after dup2 always see a valid forward fd and active capture.
+        savedStdoutFd = saved
+        isCapturing = true
+
+        setvbuf(stdout, nil, _IONBF, 0)
+
+        let outFd = FileHandle.standardOutput.fileDescriptor
+        let pipeWriteFd = pipe.fileHandleForWriting.fileDescriptor
+        if dup2(pipeWriteFd, outFd) == -1 {
+            isCapturing = false
+            savedStdoutFd = -1
+            close(saved)
+            pipe.fileHandleForReading.readabilityHandler = nil
+            return
+        }
+
+        inputPipe = pipe
+    }
+
+    private func stopCapturingInternal() {
+        guard isCapturing else { return }
+        isCapturing = false
+
+        inputPipe?.fileHandleForReading.readabilityHandler = nil
+
+        fflush(stdout)
+
+        if savedStdoutFd >= 0 {
+            let outFd = FileHandle.standardOutput.fileDescriptor
+            _ = dup2(savedStdoutFd, outFd)
+            close(savedStdoutFd)
+            savedStdoutFd = -1
+        }
+
+        inputPipe = nil
+
+        lineBufferLock.lock()
+        lineBuffer.removeAll()
+        lineBufferLock.unlock()
+    }
+
+    private func appendAndProcessLines(_ data: Data) {
+        lineBufferLock.lock()
+        lineBuffer.append(data)
+
+        while let newlineIndex = lineBuffer.firstIndex(of: 0x0a) {
+            let rawLine = lineBuffer[..<newlineIndex]
+            lineBuffer.removeSubrange(lineBuffer.startIndex ... newlineIndex)
+
+            guard !rawLine.isEmpty else { continue }
+            if let line = String(data: Data(rawLine), encoding: .utf8) {
+                let trimmed = line.trimmingCharacters(in: .newlines)
+                if !trimmed.isEmpty {
+                    processingQueue.async { [weak self] in
+                        self?.processCompleteLine(trimmed)
+                    }
+                }
+            }
+        }
+        lineBufferLock.unlock()
+    }
+
+    private func processCompleteLine(_ line: String) {
+        if let logUrl = logUrl {
+            do {
+                try line.appendLineToURL(logUrl)
+            } catch {
+                // Silent failure for file writing
+            }
+        }
+
+        guard !shouldIgnoreLog(line), shouldIncludeLog(line) else { return }
+        ConsoleOutput.shared.addPrintAndNSLogOutput(line)
+    }
+
+    private func shouldIgnoreLog(_ log: String) -> Bool {
+        DebugSwift.Console.shared.ignoredLogs.contains { log.contains($0) }
+    }
+
+    private func shouldIncludeLog(_ log: String) -> Bool {
+        if DebugSwift.Console.shared.onlyLogs.isEmpty {
+            return true
+        }
+        return DebugSwift.Console.shared.onlyLogs.contains { log.contains($0) }
     }
 }
 
