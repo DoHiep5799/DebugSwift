@@ -188,8 +188,8 @@ extension FloatBallView {
         label.text = .init(0)
         ballView.addSubview(label)
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+            label.centerXAnchor.constraint(equalTo: ballView.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: ballView.centerYAnchor)
         ])
         return label
     }
@@ -220,7 +220,8 @@ extension FloatBallView {
         label.textAlignment = .center
         label.font = .systemFont(ofSize: 12)
         label.translatesAutoresizingMaskIntoConstraints = false
-        superview?.addSubview(label)
+        addSubview(label)
+        bringSubviewToFront(label)
 
         NSLayoutConstraint.activate([
             label.centerXAnchor.constraint(equalTo: centerXAnchor),
